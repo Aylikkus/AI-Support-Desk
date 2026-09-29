@@ -3,7 +3,7 @@
 Vue 3 form -> FastAPI -> PostgreSQL. Each submitted request is analyzed synchronously by an
 OpenAI-compatible LLM, which returns a category, priority, short summary and reply draft.
 
-[Скриншот](image.png)
+![Скриншот](image.png)
 
 ## Run
 
