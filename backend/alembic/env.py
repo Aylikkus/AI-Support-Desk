@@ -3,7 +3,7 @@ from sqlalchemy import create_engine
 
 from app.core.config import settings
 from app.db.session import Base
-from app.models import ticket  # noqa: F401
+from app.models import operator_request, ticket  # noqa: F401
 
 target_metadata = Base.metadata
 

@@ -24,6 +24,13 @@ services:
         condition: service_healthy
     ports:
       - "8000:8000"
+    # The default knowledge base (backend/knowledge_base.md) is baked into the
+    # image. To use your own file, mount it over /app/knowledge_base.md or set
+    # KNOWLEDGE_BASE_PATH and mount it there:
+    #   volumes:
+    #     - ./my-knowledge-base.md:/app/my-knowledge-base.md:ro
+    #   environment:
+    #     KNOWLEDGE_BASE_PATH: my-knowledge-base.md
 
   web:
     build: ./frontend

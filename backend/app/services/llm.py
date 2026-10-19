@@ -1,21 +1,38 @@
-import json
+"""LLM service.
 
-import httpx
-from pydantic import ValidationError
+LangChain owns everything provider-related: the chat-model connection
+(OpenAI-compatible base URL), tool binding and JSON-mode responses. All of it
+stays isolated behind this module; the rest of the app never touches providers.
+"""
+
+import json
+from typing import TypeVar
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, ValidationError
 
 from app.core.config import settings
-from app.schemas.ticket import Analysis, Category, Priority
+from app.schemas.ticket import Analysis
 
-SYSTEM_PROMPT = f"""You are a support desk assistant. Analyze the customer's message and reply with a single JSON object with exactly these keys:
-- "category": one of {[c.value for c in Category]}
-- "priority": one of {[p.value for p in Priority]}. Use "urgent" for outages or security issues, "high" for money problems or blocked users, "medium" for normal issues, "low" for questions and suggestions.
-- "summary": one short sentence describing the issue.
-- "reply_draft": a polite, concise reply to the customer from the support team, addressing them by name.
-Write "summary" and "reply_draft" in the same language as the customer's message. Output only JSON."""
+TSchema = TypeVar("TSchema", bound=BaseModel)
 
 
 class LLMError(Exception):
     pass
+
+
+def get_chat_model(temperature: float = 0.2) -> BaseChatModel:
+    """Chat model bound to the configured OpenAI-compatible provider."""
+    return ChatOpenAI(
+        model=settings.llm_model,
+        api_key=settings.llm_api_key or None,
+        base_url=settings.llm_base_url or None,
+        temperature=temperature,
+        timeout=settings.llm_timeout_seconds,
+        max_retries=1,
+    )
 
 
 def _extract_json(text: str) -> dict:
@@ -30,72 +47,63 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def _post(customer_name: str, message: str) -> httpx.Response:
-    payload = {
-        "model": settings.llm_model,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Customer name: {customer_name}\n\nMessage:\n{message}"},
-        ],
-    }
-    headers = {"Authorization": f"Bearer {settings.llm_api_key}"}
-    url = f"{settings.llm_base_url.rstrip('/')}/chat/completions"
-    return httpx.post(url, json=payload, headers=headers, timeout=settings.llm_timeout_seconds)
-
-
-def _parse(resp: httpx.Response) -> tuple[str, Analysis]:
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
-    data = _extract_json(content)
-    data = {k: v.strip().lower() if k in ("category", "priority") and isinstance(v, str) else v
-            for k, v in data.items()}
-    return content, Analysis.model_validate(data)
-
-
-_PARSE_ERRORS = (httpx.HTTPError, KeyError, IndexError, TypeError, json.JSONDecodeError, ValidationError, LLMError)
-
-
-def analyze_ticket(customer_name: str, message: str) -> Analysis:
+def ask_json(schema: type[TSchema], messages: list, temperature: float = 0.2) -> TSchema:
+    """Invoke the chat model in JSON mode and validate the answer with a Pydantic schema (one retry)."""
+    model = get_chat_model(temperature).bind(response_format={"type": "json_object"})
     last_error: Exception | None = None
     for _ in range(2):
         try:
-            return _parse(_post(customer_name, message))[1]
-        except _PARSE_ERRORS as exc:
+            resp = model.invoke(messages)
+            content = resp.content if isinstance(resp.content, str) else str(resp.content)
+            return schema.model_validate(_extract_json(content))
+        except (LLMError, json.JSONDecodeError, ValidationError) as exc:
             last_error = exc
-    raise LLMError(f"LLM analysis failed: {last_error}")
+    raise LLMError(f"LLM response failed validation: {last_error}")
+
+
+CHECK_SYSTEM = """Ты — ассистент службы поддержки. Проанализируй обращение клиента и ответь одним JSON-объектом с ключами:
+- "category": одна из [payment, technical, account, delivery, product, other]
+- "priority": одна из [low, medium, high, urgent]. urgent — сбой сервиса или проблема безопасности; high — деньги или заблокированный клиент; medium — обычные обращения; low — вопросы и предложения.
+- "summary": одно короткое предложение, описывающее суть проблемы.
+- "reply_draft": вежливый краткий ответ клиенту от лица службы поддержки.
+Выведи только JSON."""
+
+CHECK_SAMPLE = "Меня дважды списали оплату за заказ №123, но товар так и не пришёл."
+
+_PARSE_ERRORS = (json.JSONDecodeError, ValidationError, LLMError)
 
 
 def check_llm() -> dict:
-    """Single attempt with a sample ticket; always returns the raw provider output."""
+    """Single attempt with a sample ticket; always returns the raw model output."""
     result: dict = {
         "ok": False,
         "base_url": settings.llm_base_url,
         "model": settings.llm_model,
-        "http_status": None,
         "error": None,
-        "raw_response": None,
         "content": None,
         "parsed": None,
     }
     try:
-        resp = _post("Test User", "I was charged twice for my order #123 but received nothing.")
-    except httpx.HTTPError as exc:
+        resp = get_chat_model().bind(response_format={"type": "json_object"}).invoke(
+            [
+                SystemMessage(CHECK_SYSTEM),
+                HumanMessage(f"Имя клиента: Иван\n\nСообщение:\n{CHECK_SAMPLE}"),
+            ]
+        )
+    except Exception as exc:  # provider/auth/network errors from the LangChain stack
         result["error"] = f"{type(exc).__name__}: {exc}"
         return result
 
-    result["http_status"] = resp.status_code
-    result["raw_response"] = resp.text
+    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    result["content"] = content
     try:
-        content, analysis = _parse(resp)
-        result["content"] = content
-        result["parsed"] = analysis.model_dump(mode="json")
+        data = _extract_json(content)
+        data = {
+            k: v.strip().lower() if k in ("category", "priority") and isinstance(v, str) else v
+            for k, v in data.items()
+        }
+        result["parsed"] = Analysis.model_validate(data).model_dump(mode="json")
         result["ok"] = True
     except _PARSE_ERRORS as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            result["content"] = resp.json()["choices"][0]["message"]["content"]
-        except Exception:
-            pass
     return result

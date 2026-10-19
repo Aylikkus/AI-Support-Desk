@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: float = 60.0
+    knowledge_base_path: str = "knowledge_base.md"
 
 
 settings = Settings()

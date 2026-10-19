@@ -1,29 +1,25 @@
 import json
 
-import httpx
-import pytest
 from fastapi.testclient import TestClient
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
 
 from app.main import app
-from app.services import llm
+from app.services import llm as llm_module
 
 client = TestClient(app)
 
 
-def _mock(monkeypatch, handler):
-    transport = httpx.MockTransport(handler)
-    monkeypatch.setattr(
-        llm.httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
-    )
-
-
-def _chat(content: str):
-    return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+def _mock(monkeypatch, messages):
+    fake = GenericFakeChatModel(messages=iter(messages))
+    monkeypatch.setattr(llm_module, "get_chat_model", lambda *args, **kwargs: fake)
 
 
 def test_check_ok(monkeypatch):
-    good = json.dumps({"category": "Payment", "priority": "HIGH", "summary": "s", "reply_draft": "r"})
-    _mock(monkeypatch, lambda req: _chat(good))
+    good = json.dumps(
+        {"category": "Payment", "priority": "HIGH", "summary": "s", "reply_draft": "r"}
+    )
+    _mock(monkeypatch, [AIMessage(content=good)])
     resp = client.get("/api/llm/check")
     body = resp.json()
     assert resp.status_code == 200
@@ -33,7 +29,7 @@ def test_check_ok(monkeypatch):
 
 
 def test_check_non_json_content_is_returned(monkeypatch):
-    _mock(monkeypatch, lambda req: _chat("Sorry, I can't help with that."))
+    _mock(monkeypatch, [AIMessage(content="Sorry, I can't help with that.")])
     resp = client.get("/api/llm/check")
     body = resp.json()
     assert resp.status_code == 502
@@ -42,21 +38,16 @@ def test_check_non_json_content_is_returned(monkeypatch):
     assert "LLMError" in body["error"]
 
 
-def test_check_http_error_returns_raw_body(monkeypatch):
-    _mock(monkeypatch, lambda req: httpx.Response(401, text='{"error": "bad key"}'))
-    resp = client.get("/api/llm/check")
-    body = resp.json()
-    assert resp.status_code == 502
-    assert body["http_status"] == 401
-    assert "bad key" in body["raw_response"]
+def test_check_provider_error(monkeypatch):
+    class Boom:
+        def bind(self, **kwargs):
+            return self
 
+        def invoke(self, messages, **kwargs):
+            raise RuntimeError("connection refused")
 
-def test_check_connection_error(monkeypatch):
-    def boom(req):
-        raise httpx.ConnectError("refused")
-
-    _mock(monkeypatch, boom)
+    monkeypatch.setattr(llm_module, "get_chat_model", lambda *args, **kwargs: Boom())
     body = client.get("/api/llm/check").json()
     assert body["ok"] is False
-    assert "ConnectError" in body["error"]
-    assert body["http_status"] is None
+    assert "RuntimeError" in body["error"]
+    assert body["content"] is None

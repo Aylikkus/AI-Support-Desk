@@ -1,47 +1,26 @@
-import os
-
-os.environ["DATABASE_URL"] = "sqlite://"
-
-import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-from app.api import tickets as tickets_api
-from app.db.session import Base, get_db
-from app.main import app
-from app.models import ticket  # noqa: F401
 from app.schemas.ticket import Analysis
-from app.services.llm import LLMError
+from app.services import tickets as tickets_service
+from app.services.graph import Escalation, GraphRunResult, SupportGraphError
 
-engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-TestingSession = sessionmaker(bind=engine, expire_on_commit=False)
-
-
-@pytest.fixture()
-def client():
-    Base.metadata.create_all(engine)
-
-    def override():
-        with TestingSession() as db:
-            yield db
-
-    app.dependency_overrides[get_db] = override
-    yield TestClient(app)
-    app.dependency_overrides.clear()
-    Base.metadata.drop_all(engine)
+PAYLOAD = {
+    "customer_name": "Ivan",
+    "customer_email": "ivan@example.com",
+    "message": "Charged but no order!",
+}
 
 
-PAYLOAD = {"customer_name": "Ivan", "customer_email": "ivan@example.com", "message": "Charged but no order!"}
+def _ok_run() -> GraphRunResult:
+    return GraphRunResult(
+        thread_id="ticket-test",
+        analysis=Analysis(
+            category="payment", priority="high", summary="Charged w/o order", reply_draft="Hi!"
+        ),
+        escalation=None,
+    )
 
 
 def test_create_ticket_processed(client, monkeypatch):
-    monkeypatch.setattr(
-        tickets_api,
-        "analyze_ticket",
-        lambda name, msg: Analysis(category="payment", priority="high", summary="Charged w/o order", reply_draft="Hi!"),
-    )
+    monkeypatch.setattr(tickets_service, "run_support_graph", lambda name, msg: _ok_run())
     resp = client.post("/api/tickets", json=PAYLOAD)
     assert resp.status_code == 201
     body = resp.json()
@@ -51,15 +30,49 @@ def test_create_ticket_processed(client, monkeypatch):
     assert client.get(f"/api/tickets/{body['id']}").json()["reply_draft"] == "Hi!"
 
 
-def test_llm_failure_keeps_ticket(client, monkeypatch):
+def test_graph_failure_keeps_ticket(client, monkeypatch):
     def boom(name, msg):
-        raise LLMError("down")
+        raise SupportGraphError("down")
 
-    monkeypatch.setattr(tickets_api, "analyze_ticket", boom)
+    monkeypatch.setattr(tickets_service, "run_support_graph", boom)
     resp = client.post("/api/tickets", json=PAYLOAD)
     assert resp.status_code == 201
     assert resp.json()["status"] == "failed"
     assert len(client.get("/api/tickets", params={"status": "failed"}).json()) == 1
+
+
+def test_create_ticket_escalates(client, monkeypatch):
+    run = GraphRunResult(
+        thread_id="ticket-test",
+        analysis=None,
+        escalation=Escalation(question="Уточните номер заказа", category="payment", priority="high"),
+    )
+    monkeypatch.setattr(tickets_service, "run_support_graph", lambda name, msg: run)
+
+    body = client.post("/api/tickets", json=PAYLOAD).json()
+    assert body["status"] == "pending_operator"
+    assert body["category"] == "payment"
+    assert body["reply_draft"] is None
+
+
+def test_reanalyze_cancels_pending_request(client, monkeypatch):
+    run = GraphRunResult(
+        thread_id="ticket-test",
+        analysis=None,
+        escalation=Escalation(question="Уточните номер заказа", category="payment", priority="high"),
+    )
+    monkeypatch.setattr(tickets_service, "run_support_graph", lambda name, msg: run)
+    ticket = client.post("/api/tickets", json=PAYLOAD).json()
+    request_id = client.get("/api/operator/requests").json()[0]["id"]
+
+    monkeypatch.setattr(tickets_service, "run_support_graph", lambda name, msg: _ok_run())
+    body = client.post(f"/api/tickets/{ticket['id']}/reanalyze").json()
+    assert body["status"] == "processed"
+
+    queue = client.get("/api/operator/requests").json()
+    assert queue[0]["status"] == "cancelled"
+    assert client.get("/api/operator/requests", params={"status": "pending"}).json() == []
+    assert client.post(f"/api/operator/requests/{request_id}/answer", json={"answer": "x"}).status_code == 409
 
 
 def test_validation(client):
